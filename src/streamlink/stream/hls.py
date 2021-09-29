@@ -5,6 +5,7 @@ from collections import OrderedDict, defaultdict
 from concurrent.futures import Future
 from threading import Event
 from typing import List, NamedTuple, Optional, Union
+from urllib import request
 from urllib.parse import urlparse
 
 # noinspection PyPackageRequirements
@@ -72,12 +73,19 @@ class HLSStreamWriter(SegmentedStreamWriter):
             key_uri = key.uri
 
         if self.key_uri != key_uri:
-            res = self.session.http.get(key_uri, exception=StreamError,
-                                        retries=self.retries,
-                                        **self.reader.request_params)
-            res.encoding = "binary/octet-stream"
-            self.key_data = res.content
-            self.key_uri = key_uri
+            if 'data:;base64' in key_uri:
+                log.info('Parsing data uri')
+                with request.urlopen(key_uri) as response:
+                    data = response.read()
+                self.key_data = data
+                self.key_uri = key_uri
+            else:
+                res = self.session.http.get(key_uri, exception=StreamError,
+                                            retries=self.retries,
+                                            **self.reader.request_params)
+                res.encoding = "binary/octet-stream"
+                self.key_data = res.content
+                self.key_uri = key_uri
 
         iv = key.iv or self.num_to_iv(num)
 
