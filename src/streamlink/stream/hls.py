@@ -13,7 +13,7 @@ from Crypto.Cipher import AES
 # noinspection PyPackageRequirements
 from Crypto.Util.Padding import unpad
 from requests import Response
-from requests.exceptions import ChunkedEncodingError, ConnectionError, ContentDecodingError
+from requests.exceptions import ChunkedEncodingError, ConnectionError, ContentDecodingError, StreamConsumedError
 
 from streamlink.exceptions import StreamError
 from streamlink.stream.ffmpegmux import FFMPEGMuxer, MuxedStream
@@ -32,6 +32,9 @@ class Sequence(NamedTuple):
 
 
 class HLSStreamWriter(SegmentedStreamWriter):
+
+    WRITE_CHUNK_SIZE = 8192
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         options = self.session.options
@@ -41,6 +44,7 @@ class HLSStreamWriter(SegmentedStreamWriter):
         self.key_data = None
         self.key_uri = None
         self.key_uri_override = options.get("hls-segment-key-uri")
+        self.stream_data = options.get("hls-segment-stream-data")
 
         self.ignore_names = False
         ignore_names = {*options.get("hls-segment-ignore-names")}
@@ -135,7 +139,7 @@ class HLSStreamWriter(SegmentedStreamWriter):
 
     def fetch(self, sequence: Sequence) -> Optional[Response]:
         try:
-            return self._fetch(sequence.segment, not sequence.segment.key)
+            return self._fetch(sequence.segment, self.stream_data and not sequence.segment.key)
         except StreamError as err:  # pragma: no cover
             log.error(f"Failed to fetch segment {sequence.num}: {err}")
 
@@ -172,11 +176,22 @@ class HLSStreamWriter(SegmentedStreamWriter):
                 if not self.reader.filter_event.is_set():
                     log.info("Resuming stream output")
                     self.reader.filter_event.set()
+        else:
+            self._write_discard(sequence, *args, **kwargs)
+            # block reader thread if filtering out segments
+            if self.reader.filter_event.is_set():
+                log.info("Filtering out segments and pausing stream output")
+                self.reader.filter_event.clear()
 
-        # block reader thread if filtering out segments
-        elif self.reader.filter_event.is_set():
-            log.info("Filtering out segments and pausing stream output")
-            self.reader.filter_event.clear()
+    def _write_discard(self, sequence: Sequence, res: Response, is_map: bool):
+        # The full response needs to actually be read from the socket
+        # even if there isn't any intention of using the payload
+        try:
+            for _ in res.iter_content(self.WRITE_CHUNK_SIZE):
+                pass
+        except (ChunkedEncodingError, ContentDecodingError,
+                ConnectionError, StreamConsumedError):
+            pass
 
     def _write(self, sequence: Sequence, res: Response, is_map: bool):
         if sequence.segment.key and sequence.segment.key.method != "NONE":
@@ -200,7 +215,7 @@ class HLSStreamWriter(SegmentedStreamWriter):
             self.reader.buffer.write(chunk)
         else:
             try:
-                for chunk in res.iter_content(8192):
+                for chunk in res.iter_content(self.WRITE_CHUNK_SIZE):
                     self.reader.buffer.write(chunk)
             except (ChunkedEncodingError, ContentDecodingError, ConnectionError) as err:
                 log.error(f"Download of segment {sequence.num} failed ({err})")
